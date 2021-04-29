@@ -10,6 +10,7 @@
 // network
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 // system
 #include <signal.h>
@@ -31,13 +32,25 @@ int zc_flag = 0;
 
 /* Catch Signal Handler functio */
 void signal_callback_handler(int signum){
-
-        printf("Caught signal SIGPIPE %d\n",signum);
+    printf("Caught signal SIGPIPE %d\n",signum);
 }
 
 
 const int MAX_EPOLL_SIZE = 10000;
-const int PACKET_BUFFER_SIZE = 1000000000;
+const int PACKET_BUFFER_SIZE = 10000000000;
+
+int stick_this_thread_to_core(int core_id) {
+   int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+   if (core_id < 0 || core_id >= num_cores)
+      return EINVAL;
+
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset);
+
+   pthread_t current_thread = pthread_self();    
+   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+}
 
 
 class BufferPool {
@@ -53,29 +66,6 @@ public:
     ~BufferPool();
 };
 
-
-class Connection {
-public:
-    struct sockaddr_in listen_address;
-	struct sockaddr_in target_address;
-    int listen_fd;
-    int accepted_fd;
-    BufferPool buffer_pool;
-
-    int listen_port;
-    char const* upstream_ip;
-    int upstream_port;
-    int upstream_fd;
-    Connection() {};
-    Connection(int listen_fd, int accepted_fd, \
-            char const* upstream_ip, int upstream_port, int upstream_fd): 
-                listen_fd(listen_fd), accepted_fd(accepted_fd), \
-                    upstream_ip(upstream_ip), upstream_port(upstream_port), upstream_fd(upstream_fd) {}
-};
-
-using ConnectionPtr = std::shared_ptr<Connection>;
-
-
 class Upstream {
 public:
     int upstream_port;
@@ -88,25 +78,125 @@ public:
 using UpstreamPtr = std::shared_ptr<Upstream>;
 
 
+class InetConfig {
+public:
+    int port;
+    char const* ip;
+};
+
+class UnixConfig {
+public:
+    char const* unix_file;
+};
+
+class DownstreamConfig {
+public:
+    union {
+        InetConfig inet_config;
+        UnixConfig unix_config;
+    } downstream_config;
+    bool is_inet;
+};
+
+class UpstreamConfig {
+public:
+    union {
+        InetConfig inet_config;
+        UnixConfig unix_config;
+    } upstream_config;
+    bool is_inet;
+    bool downstream_inet;
+};
+
 class Config {
 public:
-    int listen_port;
-    char const* upstream_ip;
-    int upstream_port;
-    Config(int listen_port, char const* upstream_ip, int upstream_port):listen_port(listen_port), upstream_ip(upstream_ip), upstream_port(upstream_port) {};
+    DownstreamConfig downstream;
+    UpstreamConfig upstream;
+    Config(int listen_port, char const* upstream_ip, int upstream_port);
+    Config(char const* unix_file, char const* upstream_ip, int upstream_port);
+    Config(int listen_port, char const* upstream_unix_file);
+    Config(char const* downstream_unix_file, char const* upstream_unix_file);
+    int unix_listen_fd{-1}; // No SO_REUSEPORT for unix domain socket, so have to: listen in main thread and pass the listen fd to workers.
 };
+
+Config::Config(int listen_port, char const* upstream_ip, int upstream_port) {
+    downstream.is_inet = true;
+    downstream.downstream_config.inet_config.port = listen_port;
+    downstream.downstream_config.inet_config.ip = NULL;
+
+    upstream.is_inet = true;
+    upstream.downstream_inet = true;
+    upstream.upstream_config.inet_config.ip = upstream_ip;
+    upstream.upstream_config.inet_config.port = upstream_port;
+}
+
+Config::Config(char const* unix_file, char const* upstream_ip, int upstream_port) {
+    downstream.is_inet = false;
+    downstream.downstream_config.unix_config.unix_file = unix_file;
+
+    upstream.downstream_inet = false;
+    upstream.is_inet = true;
+    upstream.upstream_config.inet_config.ip = upstream_ip;
+    upstream.upstream_config.inet_config.port = upstream_port;
+
+    //For unix file, we need to construct the listen fd in the main thread, and pass it to workers.
+    int len = -1;
+    struct sockaddr_un local;
+    if ((unix_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1) {
+        perror("socket() failed\n");
+        exit(1);
+    }
+
+    local.sun_family = AF_UNIX;
+    strcpy(local.sun_path, unix_file);
+    unlink(local.sun_path);
+    len = strlen(local.sun_path) + sizeof(local.sun_family);
+    if (bind(unix_listen_fd, (struct sockaddr *)&local, len) == -1) {
+        perror("bind() failed\n");
+        exit(1);
+    }
+
+    if (listen(unix_listen_fd, SOMAXCONN) == -1) {
+        perror("listen() failed\n");
+        exit(1);
+    }
+}
+
+Config::Config(int listen_port, char const* upstream_unix_file) {
+    downstream.is_inet = true;
+    downstream.downstream_config.inet_config.port = listen_port;
+
+    upstream.downstream_inet = true;
+    upstream.is_inet = false;
+    upstream.upstream_config.unix_config.unix_file = upstream_unix_file;
+}
+
+class Connection {
+public:
+    // struct sockaddr_in listen_address;
+	// struct sockaddr_in target_address;
+    int accepted_fd;
+    int client_fd;
+    BufferPool buffer_pool;
+    // Config config;
+    Connection() {};
+    Connection(int accepted_fd, int client_fd): accepted_fd(accepted_fd), client_fd(client_fd) {}
+};
+
+using ConnectionPtr = std::shared_ptr<Connection>;
 
 class Worker {
 private:
     int epoll_fd;
     std::unordered_map<int, ConnectionPtr> connection_mapping; //fd: connection
     std::unordered_map<int, int> fd_mapping;
-    std::unordered_map<int, UpstreamPtr> listen_mapping; //listen fd : upstream
+    std::unordered_map<int, UpstreamConfig> listen_mapping; //listen fd : upstream
     std::vector<Config>& configs;
     std::unordered_map<int, bool> zerocopy_mapping; //check whether fd is zerocopy fd.
     std::unordered_map<int, int> zerocopy_runtime;
     // std::unordered_map<int, bool> write_next_time;
 public:
+    int accept_count{0};
     int fail_read_count{0};
     int fail_write_count{0};
     int cpu;
@@ -115,7 +205,7 @@ public:
     ~Worker() {};
     int Serve();
     int buildListener(Config&);
-    int onConnection(std::unordered_map<int, UpstreamPtr>::iterator& iter);
+    int onConnection(std::unordered_map<int, UpstreamConfig>::iterator& iter);
     int onDataIn(int fd);
     int onDataOut(int fd);
     int onDataError(int fd);
@@ -131,12 +221,15 @@ private:
 public:
     // void Handle();
     int addProxy(int listen_port, char const* upstream_ip, int upstream_port);
+    int addProxy(char const* unix_file, char const* upstream_ip, int upstream_port);
+    int addProxy(int listen_port, char const* unix_file);
     int startWorkers(int worker_number);
     static void* threadProcess(void * arg);
 };
 
 
 bool Worker::setZeroCopy(int fd) {
+    if (zc_flag == 0) return false;
     bool zero_flag = false;
     int code;
 
@@ -147,6 +240,7 @@ bool Worker::setZeroCopy(int fd) {
         exit(1);
     }
     if (AF_UNIX == optval) {
+        std::cout << "set AF_UNIX" << std::endl;
         zero_flag = true;
     } else {
         struct sockaddr_storage addr;
@@ -173,43 +267,68 @@ bool Worker::setZeroCopy(int fd) {
     }
     zerocopy_mapping[fd] = zero_flag;
     zerocopy_runtime[fd] = -1;
-    std::cout << fd << " " << zero_flag << std::endl;
     return zero_flag;
 }
 
-
-
-
-int Worker::onConnection(std::unordered_map<int, UpstreamPtr>::iterator& iter) {
-    UpstreamPtr upstream = iter->second;
+int Worker::onConnection(std::unordered_map<int, UpstreamConfig>::iterator& iter) {
+    UpstreamConfig& upstream = iter->second;
     int listen_fd = iter->first;
     
-    //accept
-    struct sockaddr_in _addr;
-	int socklen = sizeof(sockaddr_in);
-	int accept_fd = accept(listen_fd, (struct sockaddr *)&_addr, (socklen_t*) & socklen);
+    int accept_fd = -1;
+    if (upstream.downstream_inet) {
+        std::cout << "accept INET" << std::endl;
+        struct sockaddr_in _addr;
+        int socklen = sizeof(sockaddr_in);
+        accept_fd = accept(listen_fd, (struct sockaddr *)&_addr, (socklen_t*) & socklen);
+    } else {
+        struct sockaddr_un _addr;
+        int socklen = sizeof(sockaddr_un);
+        std::cout << "accept UNIX:begin " <<  listen_fd << std::endl;
+        accept_fd = accept(listen_fd, (struct sockaddr *)&_addr, (socklen_t*) & socklen);
+        if (accept_fd < 0) {
+            std::cout << "accepted failed" << std::endl;
+            return -1;
+        }
+        std::cout << "accept UNIX:end " << accept_fd << std::endl;
+        accept_count += 1;
+    }
+    
+    printf("Thread ID: %d accept %d: totol_count: %d\n", cpu, accept_fd, accept_count);
 
     if (accept_fd < 0) {
-        std::cout << "DDDDD" << std::endl;
+        std::cout << "accepted failed" << std::endl;
+        return -1;
     }
     setZeroCopy(accept_fd);
-    //Connection Upstream
-    struct sockaddr_in target_address;
-    target_address.sin_family = AF_INET;
-    target_address.sin_port = htons(upstream->upstream_port);
-    if (inet_pton(AF_INET, upstream->upstream_ip, &target_address.sin_addr) <= 0) { return -1; }
 
-    const int flag = 1;
-    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
-    // if(setsockopt(client_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) { return -1; }
-    if(connect(client_fd,(struct sockaddr*) &target_address, sizeof(struct sockaddr_in)) < 0) { return -1; }
+    int client_fd;
+    //Connect to Upstream
+    if (upstream.is_inet) {
+        struct sockaddr_in target_address;
+        target_address.sin_family = AF_INET;
+        target_address.sin_port = htons(upstream.upstream_config.inet_config.port);
+        if (inet_pton(AF_INET, upstream.upstream_config.inet_config.ip, &target_address.sin_addr) <= 0) { return -1; }
+
+        const int flag = 1;
+        client_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(client_fd,(struct sockaddr*) &target_address, sizeof(struct sockaddr_in)) < 0) { return -1; }
+    } else {
+        //AF_UNIX
+        int len = -1;
+        struct sockaddr_un target_address;
+        target_address.sun_family = AF_UNIX;
+        strcpy(target_address.sun_path, upstream.upstream_config.unix_config.unix_file);
+        len = strlen(target_address.sun_path) + sizeof(target_address.sun_family);
+        client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (connect(client_fd, (struct sockaddr *)&target_address, len) < 0) { return -1; }
+    }
+
     setZeroCopy(client_fd);
-
-    //New Connection;
-    auto connection_downstream = std::make_shared<Connection>(listen_fd, accept_fd, upstream->upstream_ip, upstream->upstream_port, client_fd);
+    //Allocate Connection buffer
+    auto connection_downstream = std::make_shared<Connection>(accept_fd, client_fd);
     connection_mapping[accept_fd] = connection_downstream;
 
-    auto connection_upstream = std::make_shared<Connection>(listen_fd, accept_fd, upstream->upstream_ip, upstream->upstream_port, client_fd);
+    auto connection_upstream = std::make_shared<Connection>(accept_fd, client_fd);
 	connection_mapping[client_fd] = connection_upstream;
 
     fd_mapping[accept_fd] = client_fd;
@@ -230,40 +349,42 @@ int Worker::onConnection(std::unordered_map<int, UpstreamPtr>::iterator& iter) {
 	ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
 	
-	printf("Thread ID: %d OPEN: %d <--> %d\n", pid, accept_fd, client_fd);
+	// printf("Thread ID: %d OPEN: %d <--> %d\n", pid, accept_fd, client_fd);
 	return 0;
 }
 
 int Worker::buildListener(Config& config) {
 
-    struct sockaddr_in listen_address;
-    listen_address.sin_family = AF_INET;
-    listen_address.sin_port = htons(config.listen_port);
+    int listen_fd = -1;
+    if (config.downstream.is_inet) {
+        struct sockaddr_in listen_address;
+        listen_address.sin_family = AF_INET;
+        listen_address.sin_port = htons(config.downstream.downstream_config.inet_config.port);
 
-    listen_address.sin_addr.s_addr = htonl(INADDR_ANY);
+        listen_address.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	// listen
-	const int flag = 1;
-	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag)) < 0) { return -1; }
-    if (bind(listen_fd,(const struct sockaddr*)&(listen_address), sizeof(struct sockaddr_in)) < 0) { return -1; }
-    if (listen(listen_fd, SOMAXCONN) < 0) { return -1; }
+        // listen
+        const int flag = 1;
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag)) < 0) { return -1; }
+        if (bind(listen_fd,(const struct sockaddr*)&(listen_address), sizeof(struct sockaddr_in)) < 0) { return -1; }
+        if (listen(listen_fd, SOMAXCONN) < 0) { return -1; }
+    } else {
+        //AF_UNIX
+        std::cout << "unix_listen_fd" << config.unix_listen_fd << std::endl;
+        listen_fd = config.unix_listen_fd;
+    }
 
-    listen_mapping[listen_fd] = std::make_shared<Upstream>(config.upstream_port, config.upstream_ip);;
-	struct epoll_event ev;
-	ev.events = EPOLLIN;
-	ev.data.fd  = listen_fd;
-	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
-
-    return 0;
+    listen_mapping[listen_fd] = config.upstream;
+    
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd  = listen_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
 }
 
 int Worker::onDataClose(int fd) { 
-    std::cout << "Errn: " << fd << std::endl;
-    
-    // int opposite  = fd_mapping[fd]; 
-    // fd_mapping.erase(fd);
-    // fd_mapping.erase(opposite); 
+    std::cout << "onDataClose: " << fd << std::endl;
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, 0);
     close(fd);
     return -1;
@@ -324,8 +445,8 @@ int Worker::onDataOut(int out_fd) {
     ConnectionPtr connection = connection_mapping[fd_mapping[out_fd]];
     // std::cout << "should write..." << connection->buffer_pool.end - connection->buffer_pool.current << std::endl;
 	while(connection->buffer_pool.current < connection->buffer_pool.end) {
-        bool should_send = zc_flag && ((connection->buffer_pool.end-connection->buffer_pool.current) > 1000) && zerocopy_flag;
-		ret = send(out_fd, connection->buffer_pool.current+connection->buffer_pool.buffer, connection->buffer_pool.end-connection->buffer_pool.current, should_send ? MSG_ZEROCOPY: 0);
+        bool should_send = zc_flag && ((connection->buffer_pool.end-connection->buffer_pool.current) > 10240) && zerocopy_flag;
+        ret = send(out_fd, connection->buffer_pool.current+connection->buffer_pool.buffer, connection->buffer_pool.end-connection->buffer_pool.current, should_send ? MSG_ZEROCOPY: 0);
         // std::cout << zc_flag << zerocopy_flag << ":" << ret << ":" << should_send << ":" << connection->buffer_pool.end-connection->buffer_pool.current << std::endl;
 		if (ret <= 0) {
 			if (errno == EAGAIN) {
@@ -349,13 +470,12 @@ int Worker::onDataOut(int out_fd) {
                     connection->buffer_pool.end = 0;
                     struct epoll_event ev;
                     ev.data.fd = out_fd;
-                    ev.events = EPOLLIN;
+                    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
                     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, out_fd, &ev);
-                    // write_next_time[out_fd] = false;
                 } else {
                     struct epoll_event ev;
                     ev.data.fd = out_fd;
-                    ev.events = EPOLLIN|EPOLLOUT;
+                    ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
                     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, out_fd, &ev);
                 }
             } 
@@ -398,6 +518,7 @@ int Worker::onDataError(int fd) {
         onDataClose(fd);
         return 0;
     }
+    // std::cout << !(serr->ee_code & SO_EE_CODE_ZEROCOPY_COPIED) << std::endl;
     // printf("complete: %u .. %u\n",serr->ee_info, serr->ee_data);
     // printf("i can free the buff which send in seq %u .. %u\n",serr->ee_info,serr->ee_data);
 
@@ -417,6 +538,7 @@ int Worker::onDataError(int fd) {
 
 
 int Worker::Serve() {
+    // stick_this_thread_to_core(cpu);
     epoll_fd = epoll_create(MAX_EPOLL_SIZE); // epoll_create(int size); size is no longer used
 
     for (auto& config: configs) {
@@ -438,8 +560,6 @@ int Worker::Serve() {
 			}
 		}
 		for (int i = 0; i < count; i ++) {
-            // std::cout << events[i].data.fd << std::endl;
-            
 			auto it = listen_mapping.find(events[i].data.fd);
 		    if (it != listen_mapping.end()) {
 				onConnection(it);
@@ -482,14 +602,20 @@ BufferPool::~BufferPool() {
     buffer = nullptr;
 }
 
-// void Handler::Handle() {
-//     while(true) {
-        
-//     }
-// }
-
 int Handler::addProxy(int listen_port, char const* upstream_ip, int upstream_port) {
     Config config(listen_port, upstream_ip, upstream_port);
+    configs.push_back(config);
+    return 0;
+}
+
+int Handler::addProxy(char const* unix_file, char const* upstream_ip, int upstream_port) {
+    Config config(unix_file, upstream_ip, upstream_port);
+    configs.push_back(config);
+    return 0;
+}
+
+int Handler::addProxy(int listen_port, char const* unix_file) {
+    Config config(listen_port, unix_file);
     configs.push_back(config);
     return 0;
 }
@@ -511,12 +637,11 @@ int Handler::startWorkers(int worker_number) {
     for (int i = 0; i < worker_number; i++) {
         pthread_join(workers[i]->pid, NULL);  
     }
-    std::cout << "LLLL" << std::endl;
 }
 
 int main(int argc, char const *argv[])
 {
-    signal(SIGPIPE, signal_callback_handler);
+    // signal(SIGPIPE, signal_callback_handler);
     Handler handler;
     int listen_port = atoi(argv[1]);
     char const* upstream_ip = argv[2];
@@ -526,8 +651,7 @@ int main(int argc, char const *argv[])
 	// handler.addProxy(8080, "127.0.0.1", 80);
     std::cout << listen_port << upstream_ip << upstream_port << std::endl;
 	handler.addProxy(listen_port, upstream_ip, upstream_port);
-    // handler.addUDSProxy("/data00/guozhen/memcached.sock", upstream_ip, upstream_port);
+    // handler.addProxy("/data00/guozhen/memcached.sock", "10.198.60.44", 7999);
     handler.startWorkers(workers);
-	// handler.Handle();
     return 0;
 }

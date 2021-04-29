@@ -1,0 +1,453 @@
+diff --git a/include/net/sock.h b/include/net/sock.h
+index c2fb37fe1348..e17a59b9cc0c 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -365,6 +365,7 @@ struct sock {
+ 	atomic_t		sk_drops;
+ 	int			sk_rcvlowat;
+ 	struct sk_buff_head	sk_error_queue;
++	struct sk_buff_head	sk_block_zero_queue;
+ 	struct sk_buff		*sk_rx_skb_cache;
+ 	struct sk_buff_head	sk_receive_queue;
+ 	/*
+@@ -419,6 +420,7 @@ struct sock {
+ 	__u32			sk_dst_pending_confirm;
+ 	u32			sk_pacing_status; /* see enum sk_pacing */
+ 	long			sk_sndtimeo;
++	long			sk_zeroblocktimeo;
+ 	struct timer_list	sk_timer;
+ 	__u32			sk_priority;
+ 	__u32			sk_mark;
+@@ -1039,6 +1041,7 @@ static inline void sock_rps_reset_rxhash(struct sock *sk)
+ int sk_stream_wait_connect(struct sock *sk, long *timeo_p);
+ int sk_stream_wait_memory(struct sock *sk, long *timeo_p);
+ void sk_stream_wait_close(struct sock *sk, long timeo_p);
++int sk_stream_wait_uarg_error(struct sock *sk, long *timeo_p);
+ int sk_stream_error(struct sock *sk, int flags, int err);
+ void sk_stream_kill_queues(struct sock *sk);
+ void sk_set_memalloc(struct sock *sk);
+@@ -2545,6 +2548,7 @@ static inline bool sk_listener(const struct sock *sk)
+ void sock_enable_timestamp(struct sock *sk, int flag);
+ int sock_recv_errqueue(struct sock *sk, struct msghdr *msg, int len, int level,
+ 		       int type);
++int block_zerocopy_wait_check(struct sock *sk, struct ubuf_info *uarg);
+ 
+ bool sk_ns_capable(const struct sock *sk,
+ 		   struct user_namespace *user_ns, int cap);
+diff --git a/include/uapi/asm-generic/socket.h b/include/uapi/asm-generic/socket.h
+index 77f7c1638eb1..2f5126765245 100644
+--- a/include/uapi/asm-generic/socket.h
++++ b/include/uapi/asm-generic/socket.h
+@@ -119,6 +119,8 @@
+ 
+ #define SO_DETACH_REUSEPORT_BPF 68
+ 
++#define SO_ZEROBLOCKTIMEO	69
++
+ #if !defined(__KERNEL__)
+ 
+ #if __BITS_PER_LONG == 64 || (defined(__x86_64__) && defined(__ILP32__))
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index eaca71fbc47e..84953de254fd 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1224,7 +1224,10 @@ void sock_zerocopy_callback(struct ubuf_info *uarg, bool success)
+ 	if (!success)
+ 		serr->ee.ee_code |= SO_EE_CODE_ZEROCOPY_COPIED;
+ 
+-	q = &sk->sk_error_queue;
++	if (sk->sk_zeroblocktimeo != MAX_SCHEDULE_TIMEOUT)
++		q = &sk->sk_block_zero_queue;
++	else
++		q = &sk->sk_error_queue;
+ 	spin_lock_irqsave(&q->lock, flags);
+ 	tail = skb_peek_tail(q);
+ 	if (!tail || SKB_EXT_ERR(tail)->ee.ee_origin != SO_EE_ORIGIN_ZEROCOPY ||
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 12570fd46b3b..d1901fed5256 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -989,6 +989,10 @@ int sock_setsockopt(struct socket *sock, int level, int optname,
+ 		ret = sock_set_timeout(&sk->sk_sndtimeo, optval, optlen, optname == SO_SNDTIMEO_OLD);
+ 		break;
+ 
++	case SO_ZEROBLOCKTIMEO:
++		ret = sock_set_timeout(&sk->sk_zeroblocktimeo, optval, optlen, true);
++		break;
++
+ 	case SO_ATTACH_FILTER:
+ 		ret = -EINVAL;
+ 		if (optlen == sizeof(struct sock_fprog)) {
+@@ -1142,9 +1146,12 @@ int sock_setsockopt(struct socket *sock, int level, int optname,
+ 			      (sk->sk_type == SOCK_DGRAM &&
+ 			       sk->sk_protocol == IPPROTO_UDP)))
+ 				ret = -ENOTSUPP;
++		} else if (sk->sk_family == PF_UNIX){
++			if(!(sk->sk_type == SOCK_STREAM))
++				ret = -ENOTSUPP;
+ 		} else if (sk->sk_family != PF_RDS) {
+ 			ret = -ENOTSUPP;
+-		}
++		} 
+ 		if (!ret) {
+ 			if (val < 0 || val > 1)
+ 				ret = -EINVAL;
+@@ -1343,6 +1350,10 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
+ 		lv = sock_get_timeout(sk->sk_sndtimeo, &v, SO_SNDTIMEO_OLD == optname);
+ 		break;
+ 
++	case SO_ZEROBLOCKTIMEO:
++		lv = sock_get_timeout(sk->sk_zeroblocktimeo, &v, true);
++		break;
++
+ 	case SO_RCVLOWAT:
+ 		v.val = sk->sk_rcvlowat;
+ 		break;
+@@ -1770,6 +1781,7 @@ static void sk_init_common(struct sock *sk)
+ 	skb_queue_head_init(&sk->sk_receive_queue);
+ 	skb_queue_head_init(&sk->sk_write_queue);
+ 	skb_queue_head_init(&sk->sk_error_queue);
++	skb_queue_head_init(&sk->sk_block_zero_queue);
+ 
+ 	rwlock_init(&sk->sk_callback_lock);
+ 	lockdep_set_class_and_name(&sk->sk_receive_queue.lock,
+@@ -1781,6 +1793,9 @@ static void sk_init_common(struct sock *sk)
+ 	lockdep_set_class_and_name(&sk->sk_error_queue.lock,
+ 			af_elock_keys + sk->sk_family,
+ 			af_family_elock_key_strings[sk->sk_family]);
++	lockdep_set_class_and_name(&sk->sk_block_zero_queue.lock,
++			af_elock_keys + sk->sk_family,
++			af_family_elock_key_strings[sk->sk_family]);
+ 	lockdep_set_class_and_name(&sk->sk_callback_lock,
+ 			af_callback_keys + sk->sk_family,
+ 			af_family_clock_key_strings[sk->sk_family]);
+@@ -2931,6 +2946,7 @@ void sock_init_data(struct socket *sock, struct sock *sk)
+ 	sk->sk_rcvlowat		=	1;
+ 	sk->sk_rcvtimeo		=	MAX_SCHEDULE_TIMEOUT;
+ 	sk->sk_sndtimeo		=	MAX_SCHEDULE_TIMEOUT;
++	sk->sk_zeroblocktimeo		=	MAX_SCHEDULE_TIMEOUT;
+ 
+ 	sk->sk_stamp = SK_DEFAULT_STAMP;
+ #if BITS_PER_LONG==32
+@@ -3086,6 +3102,28 @@ void sock_enable_timestamp(struct sock *sk, int flag)
+ 	}
+ }
+ 
++int block_zerocopy_wait_check(struct sock *sk, struct ubuf_info *uarg)
++{
++	struct sk_buff_head *q = &sk->sk_block_zero_queue;
++	struct sk_buff *skb = NULL;
++	unsigned long flags;
++	int err = 0;
++	spin_lock_irqsave(&q->lock, flags);
++	skb = __skb_dequeue(q);
++	if(!skb_queue_empty(q))
++		printk(KERN_WARNING "warning block zero copy should be empty!\n");
++	spin_unlock_irqrestore(&q->lock, flags);
++	if (skb != NULL){
++		if ((void*)SKB_EXT_ERR(skb) != (void *)uarg)
++			printk(KERN_WARNING "uarg != SKB_EXT_ERR(skb)!\n");
++		kfree_skb(skb);
++	}
++	else
++		err = 1;
++	return err;
++}
++
++
+ int sock_recv_errqueue(struct sock *sk, struct msghdr *msg, int len,
+ 		       int level, int type)
+ {
+diff --git a/net/core/stream.c b/net/core/stream.c
+index 4f1d4aa5fb38..52609929b4d4 100644
+--- a/net/core/stream.c
++++ b/net/core/stream.c
+@@ -190,6 +190,40 @@ int sk_stream_error(struct sock *sk, int flags, int err)
+ }
+ EXPORT_SYMBOL(sk_stream_error);
+ 
++static inline int sk_stream_in_uarg_error(struct sock *sk){
++	return !skb_queue_empty_lockless(&sk->sk_block_zero_queue);
++}
++
++int sk_stream_wait_uarg_error(struct sock *sk, long *time_p)
++{
++	int err = 0;
++	long timeout = *time_p;
++	DEFINE_WAIT_FUNC(wait, woken_wake_function);
++	if (timeout) {
++		add_wait_queue(sk_sleep(sk), &wait);
++		do {
++			if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
++				goto do_err;
++ 			/*if(signal_pending(current))
++				goto do_interrupted;*/
++			if (!timeout)
++				timeout = *time_p;
++			if (sk_wait_event(sk, &timeout, sk_stream_in_uarg_error(sk), &wait))
++				break;
++		} while (1);
++	}
++out:
++	remove_wait_queue(sk_sleep(sk), &wait);
++	return err;
++do_err:
++	err = -EPIPE;
++	goto out;
++/*do_interrupted:
++	err = sock_intr_errno(*time_p);
++	goto out;*/
++}
++EXPORT_SYMBOL(sk_stream_wait_uarg_error);
++
+ void sk_stream_kill_queues(struct sock *sk)
+ {
+ 	/* First the read buffer. */
+@@ -197,6 +231,7 @@ void sk_stream_kill_queues(struct sock *sk)
+ 
+ 	/* Next, the error queue. */
+ 	__skb_queue_purge(&sk->sk_error_queue);
++	__skb_queue_purge(&sk->sk_block_zero_queue);
+ 
+ 	/* Next, the write queue. */
+ 	WARN_ON(!skb_queue_empty(&sk->sk_write_queue));
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index d0603c78811f..200c9d8b87ec 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -137,7 +137,8 @@ void inet_sock_destruct(struct sock *sk)
+ 		sk->sk_rx_skb_cache = NULL;
+ 	}
+ 	__skb_queue_purge(&sk->sk_error_queue);
+-
++	__skb_queue_purge(&sk->sk_block_zero_queue);
++	
+ 	sk_mem_reclaim(sk);
+ 
+ 	if (sk->sk_type == SOCK_STREAM && sk->sk_state != TCP_CLOSE) {
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index aa3fd61818c4..3f67390e42a2 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -784,8 +784,11 @@ static int do_ip_setsockopt(struct sock *sk, int level,
+ 		break;
+ 	case IP_RECVERR:
+ 		inet->recverr = !!val;
+-		if (!val)
++		if (!val) {
+ 			skb_queue_purge(&sk->sk_error_queue);
++			skb_queue_purge(&sk->sk_block_zero_queue);
++		}
++
+ 		break;
+ 	case IP_MULTICAST_TTL:
+ 		if (sk->sk_type == SOCK_STREAM)
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 0d9f1d65f3c6..75689c181306 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1276,7 +1276,10 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 			goto out_err;
+ 	}
+ 
+-	timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
++	if(zc && sk->sk_zeroblocktimeo != MAX_SCHEDULE_TIMEOUT)
++		timeo = sk->sk_sndtimeo;
++	else
++		timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
+ 
+ 	tcp_rate_check_app_limited(sk);  /* is sending application-limited? */
+ 
+@@ -1479,6 +1482,14 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 	}
+ out_nopush:
+ 	sock_zerocopy_put(uarg);
++	while (copied && zc && sk->sk_zeroblocktimeo != MAX_SCHEDULE_TIMEOUT ) {
++		err = sk_stream_wait_uarg_error(sk, &sk->sk_zeroblocktimeo);
++		if(err != 0){
++			printk(KERN_WARNING "there is error = %d sk_stream_wait_uarg_error \n",err);
++		}
++		if(!block_zerocopy_wait_check(sk,uarg) || err == -EPIPE)
++			break;
++	}
+ 	return copied + copied_syn;
+ 
+ do_error:
+diff --git a/net/ipv6/ipv6_sockglue.c b/net/ipv6/ipv6_sockglue.c
+index 5352c7e68c42..3bed26cdcf83 100644
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@ -818,8 +818,10 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
+ 		if (optlen < sizeof(int))
+ 			goto e_inval;
+ 		np->recverr = valbool;
+-		if (!val)
++		if (!val) {
+ 			skb_queue_purge(&sk->sk_error_queue);
++			skb_queue_purge(&sk->sk_block_zero_queue);
++		}
+ 		retv = 0;
+ 		break;
+ 	case IPV6_FLOWINFO_SEND:
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index ecadd9e482c4..0f18eaf7f1ba 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -113,6 +113,7 @@
+ #include <linux/security.h>
+ #include <linux/freezer.h>
+ #include <linux/file.h>
++#include <linux/errqueue.h>
+ 
+ #include "scm.h"
+ 
+@@ -512,6 +513,9 @@ static void unix_sock_destructor(struct sock *sk)
+ 	local_bh_disable();
+ 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
+ 	local_bh_enable();
++	skb_queue_purge(&sk->sk_error_queue);
++	skb_queue_purge(&sk->sk_block_zero_queue);
++
+ #ifdef UNIX_REFCNT_DEBUG
+ 	pr_debug("UNIX %p is destroyed, %ld are still alive.\n", sk,
+ 		atomic_long_read(&unix_nr_socks));
+@@ -1800,8 +1804,9 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
+ 	struct sk_buff *skb;
+ 	int sent = 0;
+ 	struct scm_cookie scm;
+-	bool fds_sent = false;
++	bool fds_sent = false, zc = false;
+ 	int data_len;
++	struct ubuf_info *uarg = NULL;
+ 
+ 	wait_for_unix_gc();
+ 	err = scm_send(sock, msg, &scm, false);
+@@ -1825,6 +1830,13 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
+ 	if (sk->sk_shutdown & SEND_SHUTDOWN)
+ 		goto pipe_err;
+ 
++	if(msg->msg_flags & MSG_ZEROCOPY  && len && sock_flag(sk,SOCK_ZEROCOPY)){
++		uarg = sock_zerocopy_realloc(sk,len,NULL);
++		if(uarg)
++			zc = true;
++	}
++
++
+ 	while (sent < len) {
+ 		size = len - sent;
+ 
+@@ -1834,11 +1846,14 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
+ 		/* allow fallback to order-0 allocations */
+ 		size = min_t(int, size, SKB_MAX_HEAD(0) + UNIX_SKB_FRAGS_SZ);
+ 
+-		data_len = max_t(int, 0, size - SKB_MAX_HEAD(0));
++		if (!zc)
++			data_len = max_t(int, 0, size - SKB_MAX_HEAD(0));
++		else
++			data_len = max_t(int, 0, size);
+ 
+ 		data_len = min_t(size_t, size, PAGE_ALIGN(data_len));
+ 
+-		skb = sock_alloc_send_pskb(sk, size - data_len, data_len,
++		skb = sock_alloc_send_pskb(sk, size - data_len, zc ? 0 : data_len,
+ 					   msg->msg_flags & MSG_DONTWAIT, &err,
+ 					   get_order(UNIX_SKB_FRAGS_SZ));
+ 		if (!skb)
+@@ -1852,10 +1867,17 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
+ 		}
+ 		fds_sent = true;
+ 
+-		skb_put(skb, size - data_len);
+-		skb->data_len = data_len;
+-		skb->len = size;
+-		err = skb_copy_datagram_from_iter(skb, 0, &msg->msg_iter, size);
++		if (!zc) {
++			skb_put(skb, size - data_len);
++			skb->data_len = data_len;
++			skb->len = size;
++			err = skb_copy_datagram_from_iter(skb, 0, &msg->msg_iter, size);
++		} else {
++			err = skb_zerocopy_iter_stream(sk, skb, msg, data_len, uarg);
++			if (err > 0)
++				err = 0;
++		}
++		
+ 		if (err) {
+ 			kfree_skb(skb);
+ 			goto out_err;
+@@ -1876,6 +1898,17 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
+ 
+ 	scm_destroy(&scm);
+ 
++	sock_zerocopy_put(uarg);
++	while(sent && zc &&sk->sk_zeroblocktimeo != MAX_SCHEDULE_TIMEOUT) {
++		err = sk_stream_wait_uarg_error(sk, &sk->sk_zeroblocktimeo);
++		if(err != 0)
++			printk(KERN_WARNING "there is error = %d sk_stream_wait_uarg_error \n",err);
++		if(err == -EPIPE)
++			goto pipe_err;
++		if(!block_zerocopy_wait_check(sk,uarg))
++			break;
++	}
++
+ 	return sent;
+ 
+ pipe_err_free:
+@@ -1887,6 +1920,7 @@ static int unix_stream_sendmsg(struct socket *sock, struct msghdr *msg,
+ 	err = -EPIPE;
+ out_err:
+ 	scm_destroy(&scm);
++	sock_zerocopy_put(uarg);
+ 	return sent ? : err;
+ }
+ 
+@@ -2416,6 +2450,30 @@ static int unix_stream_read_actor(struct sk_buff *skb,
+ 	return ret ?: chunk;
+ }
+ 
++static int unix_recv_error(struct socket *sock, struct msghdr *msg,
++			       size_t len)
++{
++	struct sock *sk = sock->sk;
++	struct sock_exterr_skb *serr;
++	struct sk_buff *skb;
++	int err;
++	int copied = 0;
++
++	err = -EAGAIN;
++	skb = sock_dequeue_err_skb(sk);
++	if(!skb)
++		goto out;
++
++	serr = SKB_EXT_ERR(skb);
++	put_cmsg(msg, SOL_SOCKET, sk->sk_type, sizeof(struct sock_extended_err),&serr->ee);
++	msg->msg_flags |= MSG_ERRQUEUE;
++	err = copied;
++	consume_skb(skb);
++out:
++	return err;
++}
++
++
+ static int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
+ 			       size_t size, int flags)
+ {
+@@ -2427,6 +2485,9 @@ static int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
+ 		.flags = flags
+ 	};
+ 
++	if(unlikely ( flags & MSG_ERRQUEUE ))
++		return unix_recv_error(sock, msg, size);
++
+ 	return unix_stream_read_generic(&state, true);
+ }
+ 
+@@ -2617,7 +2678,7 @@ static __poll_t unix_poll(struct file *file, struct socket *sock, poll_table *wa
+ 	mask = 0;
+ 
+ 	/* exceptional events? */
+-	if (sk->sk_err)
++	if (sk->sk_err|| !skb_queue_empty_lockless(&sk->sk_error_queue))
+ 		mask |= EPOLLERR;
+ 	if (sk->sk_shutdown == SHUTDOWN_MASK)
+ 		mask |= EPOLLHUP;
