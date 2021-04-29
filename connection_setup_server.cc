@@ -13,9 +13,8 @@
 using namespace std;
 
 #define RECEIVE_BUFFER_SIZE 10
-#define PORT 8000
 
-int main(void) {
+int main(int argc, char* argv[]) {
     int s, s2, len;
     char receive_buffer[10];
     memset(receive_buffer, '0', RECEIVE_BUFFER_SIZE);
@@ -24,11 +23,11 @@ int main(void) {
         perror("socket() failed\n");
         exit(1);
     }
-
+    int port = atoi(argv[1]);
     struct sockaddr_in saddr;
     memset(&saddr, 0, sizeof(saddr));
     saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(PORT);
+    saddr.sin_port = htons(port);
     saddr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(s, (struct sockaddr *)&saddr, sizeof(struct sockaddr)) == -1) {
