@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <unordered_map>
 #include <iostream>
+#include <sys/un.h>
 
 #define MAX_CONNECTIONS 1024
 #define BACKLOG 512
@@ -49,15 +50,24 @@ int set_nonblocking(int fd) {
 }
 
 int connect_to_upstream(char* s, int port) {
-    struct sockaddr_in target_address;
-    target_address.sin_family = AF_INET;
-    target_address.sin_port = htons(port);
-    if (inet_pton(AF_INET, s, &target_address.sin_addr) <= 0) { return -1; }
+    // struct sockaddr_in target_address;
+    // target_address.sin_family = AF_INET;
+    // target_address.sin_port = htons(port);
+    // if (inet_pton(AF_INET, s, &target_address.sin_addr) <= 0) { return -1; }
+    // const int flag = 1;
+    // int fd = socket(AF_INET, SOCK_STREAM, 0);
+    // if (connect(fd,(struct sockaddr*) &target_address, sizeof(struct sockaddr_in)) < 0) { return -1; }
 
-    const int flag = 1;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (connect(fd,(struct sockaddr*) &target_address, sizeof(struct sockaddr_in)) < 0) { return -1; }
-    return fd;
+    //AF_UNIX
+    int len = -1;
+    struct sockaddr_un target_address;
+    target_address.sun_family = AF_UNIX;
+    strcpy(target_address.sun_path, "/data00/guozhen/memcached.sock");
+    len = strlen(target_address.sun_path) + sizeof(target_address.sun_family);
+    int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (connect(client_fd, (struct sockaddr *)&target_address, len) < 0) { return -1; }
+
+    return client_fd;
 }
 
 void* thread_fn(void* arg)

@@ -37,7 +37,7 @@ void signal_callback_handler(int signum){
 
 
 const int MAX_EPOLL_SIZE = 10000;
-const int PACKET_BUFFER_SIZE = 1000000000;
+const int PACKET_BUFFER_SIZE = 100000000;
 
 int stick_this_thread_to_core(int core_id) {
    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
@@ -142,7 +142,7 @@ Config::Config(char const* unix_file, char const* upstream_ip, int upstream_port
     //For unix file, we need to construct the listen fd in the main thread, and pass it to workers.
     int len = -1;
     struct sockaddr_un local;
-    if ((unix_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+    if ((unix_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1) {
         perror("socket() failed\n");
         exit(1);
     }
@@ -314,11 +314,7 @@ int Worker::onConnection(std::unordered_map<int, UpstreamConfig>::iterator& iter
 
         const int flag = 1;
         client_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (connect(client_fd,(struct sockaddr*) &target_address, sizeof(struct sockaddr_in)) < 0) { 
-            std::cout << "connected failed" << std::endl;
-            return -1; 
-            
-        }
+        if (connect(client_fd,(struct sockaddr*) &target_address, sizeof(struct sockaddr_in)) < 0) { return -1; }
     } else {
         //AF_UNIX
         int len = -1;
@@ -350,10 +346,10 @@ int Worker::onConnection(std::unordered_map<int, UpstreamConfig>::iterator& iter
 	// event
 	struct epoll_event ev;
 	ev.data.fd = accept_fd;
-	ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP;
+	ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLOUT | EPOLLET;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, accept_fd, &ev);
 	ev.data.fd = client_fd;
-	ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP;
+	ev.events = EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLOUT |EPOLLET;
 	epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
 	
 	// printf("Thread ID: %d OPEN: %d <--> %d\n", pid, accept_fd, client_fd);
@@ -372,7 +368,7 @@ int Worker::buildListener(Config& config) {
 
         // listen
         const int flag = 1;
-        listen_fd = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, 0);
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag)) < 0) { return -1; }
         if (bind(listen_fd,(const struct sockaddr*)&(listen_address), sizeof(struct sockaddr_in)) < 0) { return -1; }
         if (listen(listen_fd, SOMAXCONN) < 0) { return -1; }
@@ -407,9 +403,10 @@ int Worker::onDataIn(int in_fd) {
 
     char* start = connection->buffer_pool.end+connection->buffer_pool.buffer;
     int size = connection->buffer_pool.capacity-connection->buffer_pool.end;
+    if (size > 16384) size = 16384;
     // bool eagain_flag = false;
-    if (connection->buffer_pool.end == connection->buffer_pool.capacity) {
-        // std::cout << "buffer overflow, blocking this socket read" << std::endl;
+    if (connection->buffer_pool.end >= connection->buffer_pool.capacity) {
+        std::cout << "buffer overflow, blocking this socket read" << std::endl;
         // fail_read_count += 1;
         
         // start = connection->buffer_pool.buffer_start;
@@ -417,20 +414,24 @@ int Worker::onDataIn(int in_fd) {
         return 0;
         // exit(1);
     }
-     
-    int ret = recv(in_fd, start, size, 0);
-    if (ret <= 0) {
-        if (errno == EAGAIN) {
-            // std::cout << "We successfully drained this read buffer" << std::endl;
-        } else {
-            std::cout << "Errno:" << errno << " " << in_fd << std::endl;
-            onDataClose(in_fd);
-            return -1;
+    while(1) {
+        int ret = recv(in_fd, start, size, 0);
+        if (ret <= 0) {
+            if (errno == EAGAIN) {
+                // std::cout << "We successfully drained this read buffer" << std::endl;
+                break;
+            } else {
+                std::cout << "Errno:" << errno << " " << in_fd << std::endl;
+                onDataClose(in_fd);
+                return -1;
+            }
         }
+        
+        connection->buffer_pool.end += ret;
+        start = connection->buffer_pool.end+connection->buffer_pool.buffer;
+        size = connection->buffer_pool.capacity-connection->buffer_pool.end;
+        if (size > 16384) size = 16384;
     }
-    connection->buffer_pool.end += ret;
-    start = connection->buffer_pool.end+connection->buffer_pool.buffer;
-    size = connection->buffer_pool.capacity-connection->buffer_pool.end;
     
     // std::cout << "Read " << ret << " bytes, from " << in_fd << std::endl;
     int out_fd = fd_mapping[in_fd];
@@ -450,7 +451,7 @@ int Worker::onDataOut(int out_fd) {
     bool zerocopy_flag = zerocopy_mapping[out_fd];
     ConnectionPtr connection = connection_mapping[fd_mapping[out_fd]];
 	while(connection->buffer_pool.current < connection->buffer_pool.end) {
-        bool should_send = zc_flag && ((connection->buffer_pool.end-connection->buffer_pool.current) > 20480) && zerocopy_flag;
+        bool should_send = zc_flag && ((connection->buffer_pool.end-connection->buffer_pool.current) > 10240) && zerocopy_flag;
         ret = send(out_fd, connection->buffer_pool.current+connection->buffer_pool.buffer, connection->buffer_pool.end-connection->buffer_pool.current, should_send ? MSG_ZEROCOPY: 0);
         // std::cout << zc_flag << zerocopy_flag << ":" << ret << ":" << should_send << ":" << connection->buffer_pool.end-connection->buffer_pool.current << std::endl;
 		if (ret <= 0) {
@@ -473,21 +474,21 @@ int Worker::onDataOut(int out_fd) {
                 if (connection->buffer_pool.current == connection->buffer_pool.end) {
                     connection->buffer_pool.current = 0;
                     connection->buffer_pool.end = 0;
-                    struct epoll_event ev;
-                    ev.data.fd = out_fd;
-                    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-                    // std::cout << "DDDD" << std::endl;
-                    if ((write_flag.find(out_fd) != write_flag.end()) && write_flag[out_fd] == true) {
-                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, out_fd, &ev);
-                        write_flag[out_fd] = false;
-                    }
+                    // struct epoll_event ev;
+                    // ev.data.fd = out_fd;
+                    // ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+                    // // std::cout << "DDDD" << std::endl;
+                    // if ((write_flag.find(out_fd) != write_flag.end()) && write_flag[out_fd] == true) {
+                    //     epoll_ctl(epoll_fd, EPOLL_CTL_MOD, out_fd, &ev);
+                    //     write_flag[out_fd] = false;
+                    // }
                 } else {
-                    struct epoll_event ev;
-                    ev.data.fd = out_fd;
-                    ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, out_fd, &ev);
-                    write_flag[out_fd] = true;
-                    // std::cout << "LLLL" << std::endl;
+                    // struct epoll_event ev;
+                    // ev.data.fd = out_fd;
+                    // ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
+                    // epoll_ctl(epoll_fd, EPOLL_CTL_MOD, out_fd, &ev);
+                    // write_flag[out_fd] = true;
+                    std::cout << "LLLL" << std::endl;
                 }
             } 
 		}
